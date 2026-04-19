@@ -37,12 +37,11 @@ None of these endpoints mutate state.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import requests
-
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 HTTP_TIMEOUT_SECONDS = 15
@@ -89,9 +88,9 @@ class SecurityFinding:
     verdict: Verdict
     statement: str          # Executive-readable one-liner
     detail: str = ""        # Technical detail / next step
-    evidence: Optional[Dict[str, Any]] = None
+    evidence: dict[str, Any] | None = None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["category"] = self.category.value
         d["verdict"] = self.verdict.value
@@ -105,7 +104,7 @@ class SecurityFinding:
 def _graph_get(
     path: str,
     access_token: str,
-    params: Optional[Dict[str, str]] = None,
+    params: dict[str, str] | None = None,
 ) -> requests.Response:
     """Issue a read-only Graph GET. Raises requests exceptions to caller."""
     return requests.get(
@@ -126,9 +125,9 @@ def _graph_get(
 # lacks Entra Agent ID (or its workload identity preview features), then
 # even if policies exist they cannot target the agent.
 
-def check_identity_anchoring(access_token: str) -> List[SecurityFinding]:
+def check_identity_anchoring(access_token: str) -> list[SecurityFinding]:
     """Determine whether agents can be identity-anchored in this tenant."""
-    findings: List[SecurityFinding] = []
+    findings: list[SecurityFinding] = []
 
     # Heuristic: look for workload identity / agent service principals.
     # "Agent 365" agents surface as service principals once provisioned.
@@ -221,8 +220,8 @@ def check_identity_anchoring(access_token: str) -> List[SecurityFinding]:
 # any of them could plausibly target workload / agent identities. We do
 # NOT claim a policy is bound to a specific agent - we report capability.
 
-def check_policy_readiness(access_token: str) -> List[SecurityFinding]:
-    findings: List[SecurityFinding] = []
+def check_policy_readiness(access_token: str) -> list[SecurityFinding]:
+    findings: list[SecurityFinding] = []
 
     # ---- Conditional Access inventory -----------------------------------
     try:
@@ -366,7 +365,7 @@ def check_policy_readiness(access_token: str) -> List[SecurityFinding]:
     return findings
 
 
-def _policy_targets_workload_identities(policy: Dict[str, Any]) -> bool:
+def _policy_targets_workload_identities(policy: dict[str, Any]) -> bool:
     """Heuristic: does a CA policy include workload identities?"""
     conditions = policy.get("conditions") or {}
     users = conditions.get("users") or {}
@@ -386,8 +385,8 @@ def _policy_targets_workload_identities(policy: Dict[str, Any]) -> bool:
 # 3. AUDIT COVERAGE (Microsoft Purview) + DLP + Defender capability
 # ---------------------------------------------------------------------------
 
-def check_audit_coverage(access_token: str) -> List[SecurityFinding]:
-    findings: List[SecurityFinding] = []
+def check_audit_coverage(access_token: str) -> list[SecurityFinding]:
+    findings: list[SecurityFinding] = []
 
     # ---- Purview audit log reachability ---------------------------------
     try:
@@ -490,29 +489,17 @@ def check_audit_coverage(access_token: str) -> List[SecurityFinding]:
             service_plans=sku_service_plans,
         ))
 
-    # ---- Risk classification summary (always emitted) -------------------
-    findings.append(SecurityFinding(
-        category=Category.AUDIT_DLP,
-        name="Risk classification - current bypass posture",
-        verdict=_rollup_risk(findings),
-        statement=_risk_statement(findings),
-        detail=(
-            "This is a heuristic rollup. Any FAIL above means agent actions "
-            "would currently bypass that control surface."
-        ),
-    ))
-
     return findings
 
 
-def _collect_service_plan_names(access_token: str) -> Optional[List[str]]:
+def _collect_service_plan_names(access_token: str) -> list[str] | None:
     try:
         resp = _graph_get("/subscribedSkus", access_token)
     except requests.RequestException:
         return None
     if resp.status_code != 200:
         return None
-    names: List[str] = []
+    names: list[str] = []
     for sku in resp.json().get("value", []):
         for plan in sku.get("servicePlans") or []:
             name = (plan.get("servicePlanName") or "").lower()
@@ -527,7 +514,7 @@ def _licensing_finding(
     statement_pass: str,
     statement_fail: str,
     hints: set[str],
-    service_plans: List[str],
+    service_plans: list[str],
 ) -> SecurityFinding:
     matched = [p for p in service_plans if any(h in p for h in hints)]
     if matched:
@@ -548,7 +535,7 @@ def _licensing_finding(
     )
 
 
-def _rollup_risk(findings: List[SecurityFinding]) -> Verdict:
+def _rollup_risk(findings: list[SecurityFinding]) -> Verdict:
     if any(f.verdict is Verdict.FAIL for f in findings):
         return Verdict.FAIL
     if any(f.verdict is Verdict.WARN for f in findings):
@@ -556,7 +543,7 @@ def _rollup_risk(findings: List[SecurityFinding]) -> Verdict:
     return Verdict.PASS
 
 
-def _risk_statement(findings: List[SecurityFinding]) -> str:
+def _risk_statement(findings: list[SecurityFinding]) -> str:
     if any(f.verdict is Verdict.FAIL for f in findings):
         return (
             "In current state, agent actions would BYPASS one or more of: "
@@ -578,24 +565,37 @@ def _risk_statement(findings: List[SecurityFinding]) -> str:
 # ENTRY POINT
 # ---------------------------------------------------------------------------
 
-def run_security_checks(access_token: str) -> List[SecurityFinding]:
+def run_security_checks(access_token: str) -> list[SecurityFinding]:
     """Run all security/governance pre-flight checks.
 
-    Returns a list of SecurityFinding ordered: Identity, Policies, Audit/DLP.
+    Returns a list of SecurityFinding ordered: Identity, Policies, Audit/DLP,
+    followed by an overall Risk Classification rollup.
     Safe to serialize each finding via .to_dict() for JSON/Markdown export.
     """
-    findings: List[SecurityFinding] = []
+    findings: list[SecurityFinding] = []
     findings.extend(check_identity_anchoring(access_token))
     findings.extend(check_policy_readiness(access_token))
     findings.extend(check_audit_coverage(access_token))
+
+    # Overall rollup - computed across ALL findings from every category.
+    findings.append(SecurityFinding(
+        category=Category.AUDIT_DLP,
+        name="Risk classification - current bypass posture",
+        verdict=_rollup_risk(findings),
+        statement=_risk_statement(findings),
+        detail=(
+            "Heuristic rollup across Identity / Policies / Audit & DLP. Any "
+            "FAIL means agent actions would currently bypass that control."
+        ),
+    ))
     return findings
 
 
-def findings_to_markdown(findings: List[SecurityFinding]) -> str:
+def findings_to_markdown(findings: list[SecurityFinding]) -> str:
     """Render findings as a Markdown table grouped by category."""
     icon = {Verdict.PASS: "✅", Verdict.WARN: "⚠️",
             Verdict.FAIL: "❌", Verdict.SKIP: "⏭️"}
-    lines: List[str] = ["# Agent 365 Security & Governance Readiness", ""]
+    lines: list[str] = ["# Agent 365 Security & Governance Readiness", ""]
     for cat in Category:
         scoped = [f for f in findings if f.category is cat]
         if not scoped:

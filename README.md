@@ -2,6 +2,8 @@
 
 A Python utility that validates your Azure/Entra environment configuration before integrating with the Agent 365 SDK.
 
+![CI](https://github.com/chriswillia/Agent-365-Readiness-Checker/actions/workflows/ci.yml/badge.svg)
+
 ## Purpose
 
 This tool catches **80% of onboarding failures** before SDK or API calls fail, giving you fast feedback on configuration issues.
@@ -33,6 +35,14 @@ Clone or download this repository, then install dependencies:
 
 ```bash
 pip install -r requirements.txt
+# or, as an installable package with console entry point:
+pip install -e .
+```
+
+After `pip install -e .`, the checker is available as:
+
+```bash
+agent365-preflight --security
 ```
 
 ### 3. Configure Your Environment
@@ -40,9 +50,16 @@ pip install -r requirements.txt
 Copy the example file and fill in your credentials:
 
 ```bash
-cp .env.example .env
+# Option 1 (dev only): client secret
+CLIENT_SECRET=your-client-secret
+# Option 2 (recommended for production): certificate auth
+# CLIENT_CERT_PATH=./cert.pem
+# CLIENT_CERT_THUMBPRINT=AA11BB22...
+FRONTIER_PREVIEW_ENABLED=false
 ```
 
+Certificate auth takes precedence when both `CLIENT_CERT_PATH` and
+`CLIENT_CERT_THUMBPRINT` are set.
 Edit `.env` with your Azure details:
 
 ```
@@ -109,7 +126,8 @@ Total checks: 7
 Passed: 6
 Failed: 1
 Pass rate: 86%
-
+- **1** - One or more critical checks failed
+- **2** - Security findings FAIL when `--fail-on-security` is set
 ✅ All critical checks passed! Your environment is ready for Agent 365 SDK integration.
 ```
 
@@ -203,12 +221,22 @@ python checker.py --security-markdown security-report.md
 [WARN]  (AUDIT/DLP) Risk classification - current bypass posture
        Controls exist but are not yet BOUND to agent identities.
 ```
+Development
 
+```bash
+pip install -e ".[dev]"
+ruff check .
+pytest -v
+```
+
+Tests mock MSAL and Microsoft Graph, so no live tenant is required.
+
+## 
 ## Support
 
 If issues persist:
-1. Double-check all credentials in `.env`
-2. Verify app registration permissions in Azure Portal
+1. Double-check all credenti
+**Python Version**: 3.9+ permissions in Azure Portal
 3. Ensure your tenant isn't blocking third-party app access
 4. Check network connectivity to `login.microsoftonline.com` and `graph.microsoft.com`
 

@@ -7,25 +7,26 @@ before attempting Agent 365 SDK or API integration.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import json
 import os
 import re
 import sys
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from enum import Enum
-from typing import List, Optional
+from typing import Any
 
+import requests
 from dotenv import load_dotenv
 from msal import ConfidentialClientApplication
-import requests
 
 from security_checks import (
     SecurityFinding,
     Verdict,
-    run_security_checks,
     findings_to_markdown,
+    run_security_checks,
 )
-
 
 # --- Constants ---------------------------------------------------------------
 
@@ -36,6 +37,17 @@ HTTP_TIMEOUT_SECONDS = 10
 GUID_PATTERN = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
+
+# App permissions (roles) we expect when --security is used. The baseline
+# check only needs Organization.Read.All; the extras light up security
+# checks. Missing roles are reported, not fatal.
+BASELINE_ROLES: set[str] = {"Organization.Read.All"}
+SECURITY_ROLES: set[str] = {
+    "Directory.Read.All",
+    "Policy.Read.All",
+    "AuditLog.Read.All",
+    "Organization.Read.All",
+}
 
 # ANSI color codes
 GREEN = "\033[92m"
@@ -67,6 +79,64 @@ class CheckResult:
     severity: Severity = Severity.CRITICAL
 
 
+# --- Token inspection --------------------------------------------------------
+
+def decode_jwt_claims(token: str) -> dict[str, Any]:
+    """Decode the payload of a JWT WITHOUT verifying signature.
+
+    Used only to inspect the `roles` claim for diagnostic reporting. The
+    token is still trusted by Graph based on its signature; we are just
+    reading Entra's own claims back to the user.
+    """
+    try:
+        _, payload_b64, _ = token.split(".")
+    except ValueError:
+        return {}
+    # Base64url pad
+    padding = "=" * (-len(payload_b64) % 4)
+    try:
+        payload_bytes = base64.urlsafe_b64decode(payload_b64 + padding)
+    except (binascii.Error, ValueError):
+        return {}
+    try:
+        return json.loads(payload_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+
+
+def extract_roles(token: str) -> set[str]:
+    """Return the set of app roles (application permissions) on the token."""
+    claims = decode_jwt_claims(token)
+    roles = claims.get("roles")
+    if isinstance(roles, list):
+        return {str(r) for r in roles}
+    return set()
+
+
+# --- Credential loading ------------------------------------------------------
+
+def load_client_credential(
+    cert_path: str | None,
+    cert_thumbprint: str | None,
+    client_secret: str | None,
+) -> str | dict[str, str] | None:
+    """Return an MSAL client_credential: cert dict if available, else secret.
+
+    Certificate auth is preferred when both are set.
+    """
+    if cert_path and cert_thumbprint:
+        if not os.path.isfile(cert_path):
+            raise FileNotFoundError(
+                f"CLIENT_CERT_PATH does not exist: {cert_path}"
+            )
+        with open(cert_path, encoding="utf-8") as fh:
+            private_key = fh.read()
+        return {"private_key": private_key, "thumbprint": cert_thumbprint}
+    if client_secret:
+        return client_secret
+    return None
+
+
 # --- Output helpers ----------------------------------------------------------
 
 def _colors_enabled() -> bool:
@@ -91,12 +161,15 @@ def _colors_enabled() -> bool:
 
 
 class Printer:
-    def __init__(self, quiet: bool = False, use_color: Optional[bool] = None) -> None:
+    def __init__(self, quiet: bool = False, use_color: bool | None = None) -> None:
         self.quiet = quiet
         self.use_color = _colors_enabled() if use_color is None else use_color
 
-    def _c(self, text: str, color: str) -> str:
+    def colorize(self, text: str, color: str) -> str:
         return f"{color}{text}{RESET}" if self.use_color else text
+
+    # Backwards-compat alias (used internally).
+    _c = colorize
 
     def header(self, text: str) -> None:
         if self.quiet:
@@ -141,14 +214,18 @@ class Agent365PreflightChecker:
         self.printer = printer
         self.skip_graph = skip_graph
         self.run_security = run_security
+        self.client_cert_path = os.getenv("CLIENT_CERT_PATH", "").strip()
+        self.client_cert_thumbprint = os.getenv(
+            "CLIENT_CERT_THUMBPRINT", ""
+        ).strip()
         self.tenant_id = os.getenv("TENANT_ID", "").strip()
         self.client_id = os.getenv("CLIENT_ID", "").strip()
         self.client_secret = os.getenv("CLIENT_SECRET", "").strip()
         self.frontier_enabled = (
             os.getenv("FRONTIER_PREVIEW_ENABLED", "false").strip().lower() == "true"
         )
-        self.results: List[CheckResult] = []
-        self.security_findings: List[SecurityFinding] = []
+        self.results: list[CheckResult] = []
+        self.security_findings: list[SecurityFinding] = []
 
     # ---- utilities -----------------------------------------------------
 
@@ -237,28 +314,77 @@ class Agent365PreflightChecker:
             ))
             ok = False
 
-        if self.client_secret:
+        if self.client_cert_path and self.client_cert_thumbprint:
+            if os.path.isfile(self.client_cert_path):
+                self._record(CheckResult(
+                    name="Client credential (certificate)",
+                    status=Status.PASS,
+                    message=(
+                        f"Using certificate auth "
+                        f"(thumbprint: {self._mask(self.client_cert_thumbprint, 6)})."
+                    ),
+                ))
+            else:
+                self._record(CheckResult(
+                    name="Client credential (certificate)",
+                    status=Status.FAIL,
+                    message=(
+                        f"CLIENT_CERT_PATH set but file not found: "
+                        f"{self.client_cert_path}"
+                    ),
+                ))
+                ok = False
+        elif self.client_secret:
             self._record(CheckResult(
-                name="Client secret",
+                name="Client credential (secret)",
                 status=Status.PASS,
-                message="Client secret is configured",
+                message=(
+                    "Client secret is configured. "
+                    "Consider certificate auth for production."
+                ),
+                severity=Severity.WARNING,
             ))
         else:
             self._record(CheckResult(
-                name="Client secret",
+                name="Client credential",
                 status=Status.FAIL,
-                message="CLIENT_SECRET not set. Create a secret in Certificates & secrets.",
+                message=(
+                    "No credential configured. Set CLIENT_SECRET, or set "
+                    "CLIENT_CERT_PATH + CLIENT_CERT_THUMBPRINT."
+                ),
             ))
             ok = False
 
         return ok
 
-    def check_token_acquisition(self) -> Optional[str]:
+    def check_token_acquisition(self) -> str | None:
         self.printer.header("4. Token Acquisition")
+        try:
+            credential = load_client_credential(
+                cert_path=self.client_cert_path or None,
+                cert_thumbprint=self.client_cert_thumbprint or None,
+                client_secret=self.client_secret or None,
+            )
+        except FileNotFoundError as e:
+            self._record(CheckResult(
+                name="Token acquisition from Entra ID",
+                status=Status.FAIL,
+                message=str(e),
+            ))
+            return None
+
+        if credential is None:
+            self._record(CheckResult(
+                name="Token acquisition from Entra ID",
+                status=Status.FAIL,
+                message="No client credential available.",
+            ))
+            return None
+
         try:
             app = ConfidentialClientApplication(
                 client_id=self.client_id,
-                client_credential=self.client_secret,
+                client_credential=credential,
                 authority=AUTHORITY_TEMPLATE.format(tenant_id=self.tenant_id),
             )
             result = app.acquire_token_for_client(scopes=GRAPH_SCOPE)
@@ -289,7 +415,7 @@ class Agent365PreflightChecker:
         ))
         return None
 
-    def check_graph_permissions(self, access_token: Optional[str]) -> None:
+    def check_graph_permissions(self, access_token: str | None) -> None:
         self.printer.header("5. Microsoft Graph Permissions")
 
         if self.skip_graph:
@@ -307,6 +433,11 @@ class Agent365PreflightChecker:
                 message="Skipped (no token available)",
             ))
             return
+
+        # Inspect the token's `roles` claim for fast, accurate diagnostics
+        # before any Graph call. Missing roles are reported but non-fatal -
+        # the probe below is the ultimate truth.
+        self._check_token_roles(access_token)
 
         messages = {
             401: "Unauthorized. Token may be invalid or expired.",
@@ -350,6 +481,46 @@ class Agent365PreflightChecker:
                 f"Unexpected response: {resp.status_code} {resp.reason}",
             ),
         ))
+
+    def _check_token_roles(self, access_token: str) -> None:
+        """Report app roles (app permissions) present on the token."""
+        roles = extract_roles(access_token)
+        expected = SECURITY_ROLES if self.run_security else BASELINE_ROLES
+        missing = sorted(expected - roles)
+
+        if not roles:
+            self._record(CheckResult(
+                name="Graph token roles claim",
+                status=Status.FAIL,
+                message=(
+                    "Token has no 'roles' claim. The service principal has "
+                    "no application permissions granted/consented."
+                ),
+            ))
+            return
+
+        if missing:
+            self._record(CheckResult(
+                name="Graph token roles claim",
+                status=Status.FAIL,
+                message=(
+                    f"Granted: {sorted(roles)}. "
+                    f"Missing expected roles: {missing}. "
+                    "Grant in Azure Portal > App registrations > API "
+                    "permissions and admin-consent."
+                ),
+                severity=(
+                    Severity.CRITICAL
+                    if expected is BASELINE_ROLES
+                    else Severity.WARNING
+                ),
+            ))
+        else:
+            self._record(CheckResult(
+                name="Graph token roles claim",
+                status=Status.PASS,
+                message=f"All expected roles present: {sorted(roles)}",
+            ))
 
     # ---- orchestration -------------------------------------------------
 
@@ -443,7 +614,7 @@ class Agent365PreflightChecker:
 
 # --- CLI ---------------------------------------------------------------------
 
-def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="agent365-preflight",
         description="Validate Azure/Entra environment readiness for Agent 365.",
@@ -487,10 +658,18 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         metavar="PATH",
         help="Write a Markdown security report to PATH (implies --security).",
     )
+    parser.add_argument(
+        "--fail-on-security",
+        action="store_true",
+        help=(
+            "Return non-zero exit if any security finding is FAIL "
+            "(default: security findings do not affect exit code)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
     if args.env_file and os.path.exists(args.env_file):
@@ -498,7 +677,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         load_dotenv()
 
-    use_color: Optional[bool] = False if args.no_color or args.as_json else None
+    use_color: bool | None = False if args.no_color or args.as_json else None
     printer = Printer(quiet=args.quiet or args.as_json, use_color=use_color)
     run_security = bool(args.security or args.security_markdown)
     checker = Agent365PreflightChecker(
@@ -535,6 +714,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             ],
         }
         print(json.dumps(payload, indent=2))
+
+    if args.fail_on_security and any(
+        f.verdict is Verdict.FAIL for f in checker.security_findings
+    ):
+        return 2
 
     return 0 if success else 1
 
