@@ -19,6 +19,13 @@ from dotenv import load_dotenv
 from msal import ConfidentialClientApplication
 import requests
 
+from security_checks import (
+    SecurityFinding,
+    Verdict,
+    run_security_checks,
+    findings_to_markdown,
+)
+
 
 # --- Constants ---------------------------------------------------------------
 
@@ -129,9 +136,11 @@ class Agent365PreflightChecker:
         self,
         printer: Printer,
         skip_graph: bool = False,
+        run_security: bool = False,
     ) -> None:
         self.printer = printer
         self.skip_graph = skip_graph
+        self.run_security = run_security
         self.tenant_id = os.getenv("TENANT_ID", "").strip()
         self.client_id = os.getenv("CLIENT_ID", "").strip()
         self.client_secret = os.getenv("CLIENT_SECRET", "").strip()
@@ -139,6 +148,7 @@ class Agent365PreflightChecker:
             os.getenv("FRONTIER_PREVIEW_ENABLED", "false").strip().lower() == "true"
         )
         self.results: List[CheckResult] = []
+        self.security_findings: List[SecurityFinding] = []
 
     # ---- utilities -----------------------------------------------------
 
@@ -361,7 +371,35 @@ class Agent365PreflightChecker:
         token = self.check_token_acquisition() if app_ok else None
         self.check_graph_permissions(token)
 
+        if self.run_security and token and not self.skip_graph:
+            self._run_security_checks(token)
+
         return self._summary()
+
+    # ---- security checks ----------------------------------------------
+
+    def _run_security_checks(self, access_token: str) -> None:
+        self.printer.header("6. Security & Governance Readiness")
+        self.security_findings = run_security_checks(access_token)
+        if not self.printer.quiet:
+            for f in self.security_findings:
+                self._render_finding(f)
+
+    def _render_finding(self, f: SecurityFinding) -> None:
+        icon_and_color = {
+            Verdict.PASS: ("PASS", GREEN),
+            Verdict.WARN: ("WARN", YELLOW),
+            Verdict.FAIL: ("FAIL", RED),
+            Verdict.SKIP: ("SKIP", YELLOW),
+        }
+        label, color = icon_and_color[f.verdict]
+        status = self.printer._c(label, color)
+        cat = f.category.value.replace("_", "/").upper()
+        print(f"[{status}]  ({cat}) {f.name}")
+        print(f"       {f.statement}")
+        if f.detail:
+            print(f"       -> {f.detail}")
+        print()
 
     # ---- summary -------------------------------------------------------
 
@@ -436,6 +474,19 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Disable ANSI color output.",
     )
+    parser.add_argument(
+        "--security",
+        action="store_true",
+        help=(
+            "Run security & governance readiness checks "
+            "(Identity / Policies / Audit & DLP). Requires a valid token."
+        ),
+    )
+    parser.add_argument(
+        "--security-markdown",
+        metavar="PATH",
+        help="Write a Markdown security report to PATH (implies --security).",
+    )
     return parser.parse_args(argv)
 
 
@@ -449,15 +500,38 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     use_color: Optional[bool] = False if args.no_color or args.as_json else None
     printer = Printer(quiet=args.quiet or args.as_json, use_color=use_color)
-    checker = Agent365PreflightChecker(printer=printer, skip_graph=args.skip_graph)
+    run_security = bool(args.security or args.security_markdown)
+    checker = Agent365PreflightChecker(
+        printer=printer,
+        skip_graph=args.skip_graph,
+        run_security=run_security,
+    )
     success = checker.run()
+
+    if args.security_markdown and checker.security_findings:
+        try:
+            with open(args.security_markdown, "w", encoding="utf-8") as fh:
+                fh.write(findings_to_markdown(checker.security_findings))
+        except OSError as e:
+            print(
+                f"Warning: could not write security markdown to "
+                f"{args.security_markdown}: {e}",
+                file=sys.stderr,
+            )
 
     if args.as_json:
         payload = {
             "success": success,
             "results": [
-                {**asdict(r), "status": r.status.value, "severity": r.severity.value}
+                {
+                    **asdict(r),
+                    "status": r.status.value,
+                    "severity": r.severity.value,
+                }
                 for r in checker.results
+            ],
+            "security_findings": [
+                f.to_dict() for f in checker.security_findings
             ],
         }
         print(json.dumps(payload, indent=2))
@@ -467,3 +541,4 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

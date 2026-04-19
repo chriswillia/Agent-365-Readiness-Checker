@@ -13,6 +13,9 @@ This tool catches **80% of onboarding failures** before SDK or API calls fail, g
 3. **Entra App Registration** - Validates app registration details format and existence
 4. **Token Acquisition** - Attempts to acquire an access token from Entra ID
 5. **Microsoft Graph Permissions** - Tests Graph API connectivity and required permissions
+6. **Security & Governance Readiness** *(opt-in via `--security`)* - Identity anchoring,
+   Conditional Access coverage, Purview audit reachability, DLP / Defender
+   licensing posture. See [Security & Governance Checks](#security--governance-checks).
 
 ## Quick Start
 
@@ -141,6 +144,65 @@ Once all checks pass, you're ready to:
 - Integrate the Agent 365 SDK
 - Make authenticated API calls to Microsoft Graph
 - Deploy Agent 365 features in your tenant
+
+## Security & Governance Checks
+
+Run with `--security` to evaluate whether agents will be **governed, audited,
+and policy-enforced** once onboarded. These are read-only, heuristic,
+pre-flight checks grouped into three categories:
+
+- **Identity** — Is Entra Agent ID / workload identity available so agents
+  can be identity-anchored? Observability can exist without identity, but
+  audit, DLP, Conditional Access and Defender correlation all require it.
+- **Policies** — Do Conditional Access policies exist, and do any target
+  workload identities? Distinguishes "policies exist but are not yet bound"
+  from "policies unavailable".
+- **Audit & DLP** — Is Microsoft Purview audit reachable, and does the
+  tenant have licensing (Purview / DLP / Defender) that enables governance
+  signals to apply to agent actions.
+
+### Additional Graph permissions (recommended for `--security`)
+
+| Permission               | Used by                                         |
+| ------------------------ | ----------------------------------------------- |
+| `Directory.Read.All`     | Enumerate workload service principals            |
+| `Policy.Read.All`        | Read Conditional Access + Security Defaults     |
+| `AuditLog.Read.All`      | Confirm Purview audit reachability              |
+| `Organization.Read.All`  | Enumerate subscribed SKUs (licensing heuristic) |
+
+Missing permissions produce `SKIP` findings, not failures.
+
+### Usage
+
+```bash
+# Human-readable security report alongside standard checks
+python checker.py --security
+
+# JSON for CI / security review tooling
+python checker.py --security --json
+
+# Export a Markdown report for a security sign-off ticket
+python checker.py --security-markdown security-report.md
+```
+
+### Example security output
+
+```
+[PASS]  (IDENTITY) Entra workload identity surface
+       Tenant exposes Entra workload identities that Agent 365 can anchor to...
+
+[WARN]  (POLICIES) Conditional Access coverage for agents
+       Conditional Access is active, but no enabled policy appears to target
+       workload/agent identities.
+       -> Policies exist but are not yet BOUND to agents.
+
+[FAIL]  (AUDIT/DLP) Data Loss Prevention (DLP) capability
+       No DLP-capable SKU detected; agent-initiated data sharing would
+       BYPASS DLP in current state.
+
+[WARN]  (AUDIT/DLP) Risk classification - current bypass posture
+       Controls exist but are not yet BOUND to agent identities.
+```
 
 ## Support
 
